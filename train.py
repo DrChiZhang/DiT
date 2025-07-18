@@ -109,59 +109,73 @@ def center_crop_arr(pil_image, image_size):
 
 def main(args):
     """
-    Trains a new DiT model.
+    Trains a new DiT model using distributed data parallel (DDP).
     """
+
+    # ---- Environment & Distributed Setup ----
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
+    # Initialize distributed training backend
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
+    rank = dist.get_rank() # ID of current process
+    device = rank % torch.cuda.device_count()  # assign GPU device per rank
+
+    # Set unique random seed per process (helps with shuffling, data aug, reproducibility)
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
-    # Setup an experiment folder:
+    # ---- Experiment Directory & Logging Setup ----
     if rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
+        # Create results directory and subfolders for this experiment
+        os.makedirs(args.results_dir, exist_ok=True)  
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
+        # Set up logger for tracking training, experiment settings etc.
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
-        logger = create_logger(None)
+        logger = create_logger(None) # secondary ranks don't log to file
 
-    # Create model:
+    # ---- Model Definition & Initialization ----
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.image_size // 8
+    latent_size = args.image_size // 8  # The patch/latent size fed to DiT (VAE convention)
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes
     )
-    # Note that parameter initialization is done within the DiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
-    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
+    # Model parameters are initialized inside DiT constructor
+    ema = deepcopy(model).to(device)    # Create an EMA (exponential moving average) copy for later validation/sampling
+    requires_grad(ema, False)           # Stop gradients for EMA model
+    model = DDP(model.to(device), device_ids=[rank])    # Wrap base model with DistributedDataParallel for multi-GPU sync
+    diffusion = create_diffusion(timestep_respacing="") # Create diffusion schedule (timesteps, noise schedule)
+
+    # Load pretrained VAE for encoding/decoding images to/from latents (as in Stable Diffusion)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
+    
+    # ---- Optimizer ----
+    # Use AdamW optimizer (paper default: lr=1e-4, no weight decay)
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
-    # Setup data:
+    # ---- Dataset & DataLoader ----
+    # Compose data augmentation and preprocessing (crop, flip, normalization)
     transform = transforms.Compose([
         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
+     # Load dataset using torchvision's ImageFolder (expects <root>/<class>/<image>)
     dataset = ImageFolder(args.data_path, transform=transform)
+
+     # DistributedSampler: shuffles/partitions data among all workers for DDP
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -169,56 +183,71 @@ def main(args):
         shuffle=True,
         seed=args.global_seed
     )
+    # DataLoader: feeds batches from the (partitioned) dataset to each GPU/process
     loader = DataLoader(
         dataset,
         batch_size=int(args.global_batch_size // dist.get_world_size()),
-        shuffle=False,
+        shuffle=False,                   # shuffling is managed by Sampler
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True                  # ensures all batches are the same size
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
-    # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
+    # ---- Prepare models for training ----
+    update_ema(ema, model.module, decay=0)  # Initialize EMA weights to match the model (no momentum, just copy)
+    model.train()                           # Set model to training mode (enables e.g. embedding dropout for CFG)
+    ema.eval()                              # Set EMA model to eval mode (should not use dropout/batchnorm)
 
-    # Variables for monitoring/logging purposes:
+    # ---- Monitoring and logging variables ----
     train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
+    
+    # ---- Main training loop (over epochs and batches) ----
     for epoch in range(args.epochs):
+        # Update sampler seed for this epoch (ensures proper shuffle, DDP best practice)
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
+                # Encode images with VAE to get latents; normalize with scale factor (e.g. SD default 0.18215)
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            # Randomly select diffusion time steps for each sample in this batch
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
+            # Compute diffusion model loss (DDPM/DiT loss API returns a dict)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
+
+            # Standard optimizer step
             opt.zero_grad()
             loss.backward()
             opt.step()
+
+            # Update the exponential moving average model using current model
             update_ema(ema, model.module)
 
-            # Log loss values:
+            # ---- Logging and stats ----
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
+
+            # Periodically print/log training statistics
             if train_steps % args.log_every == 0:
                 # Measure training speed:
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
+                # Gather average loss across all distributed workers (DDP all_reduce)
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
@@ -229,24 +258,27 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
-            # Save DiT checkpoint:
+            # ---- Save model checkpoint periodically ----
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args
+                        "model": model.module.state_dict(),  # Current model weights
+                        "ema": ema.state_dict(),             # EMA weights for sampling
+                        "opt": opt.state_dict(),             # Optimizer state (for restart)
+                        "args": args                         # Training args/config for reproducibility
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
 
+    # ---- Wrap-up: switch to eval mode for sampling or evaluation ----
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
+    # After training is complete, use EMA or model for sampling/FID/IS etc.
     logger.info("Done!")
+    # Clean up distributed resources/process group
     cleanup()
 
 
@@ -255,7 +287,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
+    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT_S_8")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)

@@ -41,8 +41,17 @@ We provide an [`environment.yml`](environment.yml) file that can be used to crea
 to run pre-trained models locally on CPU, you can remove the `cudatoolkit` and `pytorch-cuda` requirements from the file.
 
 ```bash
-conda env create -f environment.yml
-conda activate DiT
+conda create -n dit python==3.10
+conda activate dit
+
+conda install nvidia/label/cuda-12.4.0::cuda-toolkit # check nvcc version after installation
+pip install torch torchvision torchaudio
+python -c "import torch; print(torch.__version__)"
+python -c "import torch; print(torch.cuda.is_available())"
+python -c "import torchvision; print(torchvision.__version__)"
+
+pip install -r requirements.txt 
+
 ```
 
 

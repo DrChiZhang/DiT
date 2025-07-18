@@ -17,15 +17,38 @@ def create_diffusion(
     rescale_learned_sigmas=False,
     diffusion_steps=1000
 ):
+    """
+    Constructs a SpacedDiffusion object, configuring noise schedule, loss type,
+    and sampling/training options for a diffusion model.
+
+    Args:
+        timestep_respacing:      List/int/string of step spacings for accelerated sampling (e.g., [25] for 25 steps).
+        noise_schedule:          Noise schedule for beta values ("linear", "cosine", etc).
+        use_kl:                  If True, use a KL divergence loss (used in some diffusion training).
+        sigma_small:             If True, use small fixed variance for transitions.
+        predict_xstart:          If True, model predicts x_0 (the clean image); otherwise, predicts noise epsilon.
+        learn_sigma:             If True, the model learns the variance ("sigma"); otherwise, it's fixed.
+        rescale_learned_sigmas:  If True, rescales learned sigmas (typically for advanced models).
+        diffusion_steps:         Total number of diffusion steps (default 1000).
+
+    Returns:
+        SpacedDiffusion object for training or sampling.
+    """
+    # Get the beta (noise) schedule for all diffusion steps, according to the requested schedule type
     betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps)
+    # Choose loss type: KL, rescaled MSE, or standard MSE
     if use_kl:
         loss_type = gd.LossType.RESCALED_KL
     elif rescale_learned_sigmas:
         loss_type = gd.LossType.RESCALED_MSE
     else:
         loss_type = gd.LossType.MSE
+
+    # Set the step schedule for training/sampling, if not provided, use all steps (no respacing)
     if timestep_respacing is None or timestep_respacing == "":
         timestep_respacing = [diffusion_steps]
+
+    # Construct and return configured SpacedDiffusion object
     return SpacedDiffusion(
         use_timesteps=space_timesteps(diffusion_steps, timestep_respacing),
         betas=betas,
