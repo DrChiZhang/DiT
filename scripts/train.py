@@ -27,7 +27,15 @@ import argparse
 import logging
 import os
 
-from models import DiT_models
+import sys
+import os
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+models_dir = os.path.abspath(os.path.join(current_dir, '..', 'models'))
+if models_dir not in sys.path:
+    sys.path.insert(0, models_dir)
+
+from dit import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
@@ -290,7 +298,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT_S_8")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1400)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training

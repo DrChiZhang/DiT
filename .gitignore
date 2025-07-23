@@ -5,6 +5,7 @@ work_dirs*
 logs 
 assets 
 results 
+docs
 
 # Byte-compiled files
 __pycache__/
