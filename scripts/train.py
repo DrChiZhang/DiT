@@ -180,8 +180,13 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-     # Load dataset using torchvision's ImageFolder (expects <root>/<class>/<image>)
-    dataset = ImageFolder(args.data_path, transform=transform)
+    
+    # Load dataset using torchvision's ImageFolder (expects <root>/<class>/<image>)
+    # dataset = ImageFolder(args.data_path, transform=transform)
+    from torch.utils.data import Subset
+    tiny_imgnet =  ImageFolder(args.data_path, transform=transform)
+    dataset = Subset(tiny_imgnet, range(20))  # 选取前20张图片
+
 
      # DistributedSampler: shuffles/partitions data among all workers for DDP
     sampler = DistributedSampler(

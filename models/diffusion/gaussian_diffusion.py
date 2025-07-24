@@ -98,14 +98,11 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     """
     Get a pre-defined beta schedule for the given name.
-    The beta schedule library consists of beta schedules which remain similar
-    in the limit of num_diffusion_timesteps.
-    Beta schedules may be added, but should not be removed or changed once
-    they are committed to maintain backwards compatibility.
+    The beta schedule library consists of beta schedules which remain similar in the limit of num_diffusion_timesteps.
+    Beta schedules may be added, but should not be removed or changed once they are committed to maintain backwards compatibility.
     """
     if schedule_name == "linear":
-        # Linear schedule from Ho et al, extended to work for any number of
-        # diffusion steps.
+        # Linear schedule from Ho et al, extended to work for any number of diffusion steps.
         scale = 1000 / num_diffusion_timesteps
         return get_beta_schedule(
             "linear",
@@ -228,7 +225,19 @@ class GaussianDiffusion:
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
-
+    
+    """
+    #     x_start, x_t, t
+    #     │
+    #     ├─ posterior_mean_coef1[t] × x_start
+    #     ├─ posterior_mean_coef2[t] × x_t
+    #     │
+    #     └─ 两者相加 → posterior_mean
+    #     │             │
+    #     ├─ 查表后验方差、log方差
+    #     │
+    # [均值, 方差, log方差] → 返回
+    """
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """
         Compute the mean and variance of the diffusion posterior:
@@ -250,7 +259,28 @@ class GaussianDiffusion:
             == x_start.shape[0]
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
-
+    
+    """
+    #      x_t, t
+    #         │
+    # ┌────────▼──────────────┐
+    # │     模型前向推理       │
+    # │   model(x_t, t, ...)  │
+    # └────────┬──────────────┘
+    #         ↓
+    # if 方差learned类型?
+    #     ├─▶ 拆分mean, var，映射范围，取对数
+    #     └─▶ 查方差表
+    #         ↓
+    #     ┌───────────────┐
+    #     │   pred_xstart │ ←——（直接输出 或 由eps反解）
+    #     └──────┬────────┘
+    #         ↓
+    # q_posterior_mean_variance(pred_xstart, x_t, t)  
+    #         │
+    #         ↓
+    # 输出{mean, variance, log_variance, pred_xstart, extra}
+    """
     def p_mean_variance(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -679,6 +709,26 @@ class GaussianDiffusion:
                 yield out
                 img = out["sample"]
 
+    """
+    #     x_start, x_t, t
+    #     │
+    # q_posterior_mean_variance
+    #     ↓
+    # true_mean, true_log_var
+    #     │
+    # [模型输出]
+    #     │
+    # p_mean_variance ───► out['mean'], out['log_variance'], out['pred_xstart']
+    #     │
+    #     ├─ KL散度: normal_kl(true_mean, true_log_var, model_mean, model_log_var)
+    #     │
+    #     └─ decoder_nll: -discretized_gaussian_log_likelihood(...)
+    #     │
+    # 按 t==0/else 切换  │
+    #     └────► output = where(t==0, decoder_nll, kl)
+    #                         │
+    #             返回 {"output": output, "pred_xstart": ...}
+    """
     def _vb_terms_bpd(
             self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
     ):
@@ -711,7 +761,59 @@ class GaussianDiffusion:
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
-
+    
+    """
+    #         x_start（真实图片）
+    #         │
+    #     [1] 若无外部噪声
+    #         ├─────────────┐
+    #         ↓（采样高斯噪声）       │
+    #     noise ←─────┘
+    #         │
+    #     [2] 用 q_sample 构造扩散后的 x_t
+    #         │
+    #     x_t = q_sample(x_start, t, noise)
+    #         │
+    #     [3] 损失类型分支:
+    #     ┌───────────────────────────────┐
+    #     │                               │
+    # ┌────▼─────┐                   ┌─────▼──────┐
+    # │ loss_type│==KL/RESCALED_KL   │ loss_type==MSE/RESCALED_MSE
+    # └────┬─────┘                   └───┬────────┘
+    #     │                             │
+    # [4A] 算变分下界/                   │
+    #     │    KL损失_VB                │
+    #     │ terms["loss"] =             │
+    #     │    _vb_terms_bpd(...)       │
+    #     │                             │
+    #     └────────────┬────────────────┘
+    #                 │
+    #             [4B] MSE相关分支
+    #                 │
+    #             model_output = model(x_t, t, **model_kwargs)
+    #                 │
+    #     ┌──────────────┴───────────────────────────────┐
+    #     │ 检查是否模型“联合学习方差” (model_var_type)    │
+    #     │  ┌——————————┐                                │
+    #     │  │是         │ 否                             │
+    #     │  ↓           ↓                               │
+    #     │分 output为(mean, var) │ 直接 output为预测目标  │
+    #     │算vb   terms["vb"]=...│                        │
+    #     └──────────────┬───────────────────────────────┘
+    #                 │
+    #         [5] 计算MSE目标(target)
+    #             target ←  按 mean_type选
+    #             （可能是：x_start 或 noise 或 x_t-1）
+    #                 │
+    #         terms["mse"] = mean_flat((target - model_output)²)
+    #                 │
+    #         若含有 terms["vb"]:
+    #             terms["loss"] = terms["mse"] + terms["vb"]
+    #         否则:
+    #             terms["loss"] = terms["mse"]
+    #                 │
+    #             return terms（包含 'loss', 'mse'...）
+    """
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
@@ -731,50 +833,42 @@ class GaussianDiffusion:
         x_t = self.q_sample(x_start, t, noise=noise)
 
         terms = {}
-
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             terms["loss"] = self._vb_terms_bpd(
-                model=model,
-                x_start=x_start,
-                x_t=x_t,
-                t=t,
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-            )["output"]
+                                                model=model,
+                                                x_start=x_start,
+                                                x_t=x_t,
+                                                t=t,
+                                                clip_denoised=False,
+                                                model_kwargs=model_kwargs,
+                            )["output"]
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t, t, **model_kwargs)
 
-            if self.model_var_type in [
-                ModelVarType.LEARNED,
-                ModelVarType.LEARNED_RANGE,
-            ]:
+            if self.model_var_type in [ ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
                 B, C = x_t.shape[:2]
                 assert model_output.shape == (B, C * 2, *x_t.shape[2:])
                 model_output, model_var_values = th.split(model_output, C, dim=1)
-                # Learn the variance using the variational bound, but don't let
-                # it affect our mean prediction.
+                # Learn the variance using the variational bound, but don't let it affect our mean prediction.
                 frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
                 terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
-                    x_t=x_t,
-                    t=t,
-                    clip_denoised=False,
-                )["output"]
+                                                model=lambda *args, r=frozen_out: r, # Python匿名函数（lambda）+ 默认参数的典型组合用法，经常用来"临时伪装"一个模型接口，让其无论传入什么参数，都只返回你想要的那个张量frozen_out
+                                                x_start=x_start,
+                                                x_t=x_t,
+                                                t=t,
+                                                clip_denoised=False,
+                            )["output"]
                 if self.loss_type == LossType.RESCALED_MSE:
-                    # Divide by 1000 for equivalence with initial implementation.
-                    # Without a factor of 1/1000, the VB term hurts the MSE term.
-                    terms["vb"] *= self.num_timesteps / 1000.0
+                    terms["vb"] *= self.num_timesteps / 1000.0  # Divide by 1000 for equivalence with initial implementation. Without a factor of 1/1000, the VB term hurts the MSE term.
 
             target = {
-                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
-                )[0],
+                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance( x_start=x_start, x_t=x_t, t=t )[0],
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
+
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:

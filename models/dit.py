@@ -23,7 +23,11 @@ def modulate(x, shift, scale):
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
-
+"""
+    ┌────────────┐    fourier embedding          ┌──────────────┐
+scalar    t │            │ ───────────────────────────→ │ vector [D]   │
+            └────────────┘   (D = frequency_embed_size) └──────────────┘
+"""
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations suitable for use as 
@@ -52,7 +56,7 @@ class TimestepEmbedder(nn.Module):
             max_period (float): Controls the minimum frequency/band in the embedding.
 
         Returns:
-            torch.Tensor of shape [batch, dim]: sinusoidal timestep embeddings.
+            torch.Tensor of shape [batch, embedding_dim]: sinusoidal timestep embeddings.
         """
         # Half the embedding dims will be cos, the rest sin
         half = dim // 2
@@ -252,15 +256,15 @@ class DiT(nn.Module):
     """
     def __init__(
         self,
-        input_size=32,
         patch_size=2,
+        num_classes=1000,
+        input_size=32,
         in_channels=4,
         hidden_size=1152,
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
-        num_classes=1000,
         learn_sigma=True,
     ):
         super().__init__()
@@ -270,7 +274,11 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
 
-        # Patch embedding layer: splits image into patches and projects to hidden_size
+        # Patch embedding layer: splits image into patches and projects to hidden_size, i.e. embed_dim
+        """
+        Input: [B, C, H, W]
+        Output: [B, N_patches, embed_dim]
+        """
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         # Timestep embedding (for diffusion step conditioning)
         self.t_embedder = TimestepEmbedder(hidden_size)
