@@ -185,7 +185,7 @@ def main(args):
     # dataset = ImageFolder(args.data_path, transform=transform)
     from torch.utils.data import Subset
     tiny_imgnet =  ImageFolder(args.data_path, transform=transform)
-    dataset = Subset(tiny_imgnet, range(20))  # 选取前20张图片
+    dataset = Subset(tiny_imgnet, range(512))  # 选取前 n 张图片
 
 
      # DistributedSampler: shuffles/partitions data among all workers for DDP

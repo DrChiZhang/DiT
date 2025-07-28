@@ -4,7 +4,7 @@
 #     IDDPM: https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
 
 import numpy as np
-import torch as th
+import torch
 
 from .gaussian_diffusion import GaussianDiffusion
 
@@ -99,7 +99,7 @@ class _WrappedModel:
             # For ts = tensor([0, 1, 2]) and
             #    self.timestep_map = [0, 40, 80, ..., 960],  ts=2 mapped to original t=80.
         """
-        map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
+        map_tensor = torch.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
         new_ts = map_tensor[ts]
         # If wanted: rescale timesteps to e.g., range [0,1000] as per DDPM conventions
         # if self.rescale_timesteps:

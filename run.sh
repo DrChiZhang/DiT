@@ -24,13 +24,13 @@ conda_env="/home/chizhang/myprefix/anaconda3/envs/dit"
 source /home/chizhang/myprefix/anaconda3/etc/profile.d/conda.sh
 conda activate $conda_env
 export CUDA_HOME=$conda_env
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,3
 
 echo "============================================================================================"
 echo "Starting training taks"
 echo "============================================================================================"
 
-torchrun --nnodes=1 --nproc_per_node=2 ./scripts/train.py --model DiT-S/8 --data-path ./assets/tiny-imagenet-200/train
+torchrun --nnodes=1 --nproc_per_node=2 ./scripts/train.py --model DiT-S/8 --data-path ./assets/tiny-imagenet-200/train --epochs 10  --log-every 10 --ckpt-every 10
 
 echo "============================================================================================"
 echo "Task completed."
