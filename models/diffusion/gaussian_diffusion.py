@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import enum
 
-from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
+from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, extract_into_tensor
 
 
 def mean_flat(tensor):
@@ -97,26 +97,50 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     """
-    Get a pre-defined beta schedule for the given name.
-    The beta schedule library consists of beta schedules which remain similar in the limit of num_diffusion_timesteps.
-    Beta schedules may be added, but should not be removed or changed once they are committed to maintain backwards compatibility.
+    根据名称获取预定义的 beta schedule（扩散过程中每一步添加的噪声强度表）。
+    
+    参数：
+    - schedule_name: str，beta schedule 的名称（如 "linear", "squaredcos_cap_v2"）
+    - num_diffusion_timesteps: int，总的扩散步骤数量 T
+
+    返回：
+    - 一个长度为 num_diffusion_timesteps 的 beta 数组，用于前向扩散过程。
+    
+    注：
+    beta 是扩散模型中每一步添加的噪声方差，较小的 beta 表示保留更多原始图像的信息。
     """
+    
     if schedule_name == "linear":
-        # Linear schedule from Ho et al, extended to work for any number of diffusion steps.
+        # 如果选择线性beta调度器（来自 Ho et al. 的论文 DDPM）
+        
+        # 为了适配任意步数，将1000步标准调度器按比例缩放
         scale = 1000 / num_diffusion_timesteps
+        
+        # 返回线性变化的 beta 数组
+        # beta 从 scale * 0.0001 线性增长到 scale * 0.02
         return get_beta_schedule(
-            "linear",
-            beta_start=scale * 0.0001,
-            beta_end=scale * 0.02,
-            num_diffusion_timesteps=num_diffusion_timesteps,
+            "linear",                             # 调度器类型
+            beta_start=scale * 0.0001,            # 起始 beta 值（很小）
+            beta_end=scale * 0.02,                # 终止 beta 值（较大）
+            num_diffusion_timesteps=num_diffusion_timesteps  # 步数
         )
+
     elif schedule_name == "squaredcos_cap_v2":
+        # 如果选择余弦调度器（来自 Improved-DDPM）
+        
+        # 使用 alpha_bar 函数（累计保留信息量）来间接计算 beta
+        # 这个 lambda 函数定义了 alpha_bar 随时间 t 的变化曲线
+        # t 是归一化时间（0~1），cos 余弦函数提供平滑下降效果
         return betas_for_alpha_bar(
             num_diffusion_timesteps,
-            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
+            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+            # 这个形式是 cap_v2 的关键，限制开头不要变化太快
         )
+
     else:
+        # 如果传入了未知的调度器名称，则抛出错误提示
         raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
+
 
 
 def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
@@ -181,7 +205,7 @@ class GaussianDiffusion:
         self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
         self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        # calculations for posterior variance.
         self.posterior_variance = (
             betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         )
@@ -189,7 +213,9 @@ class GaussianDiffusion:
         self.posterior_log_variance_clipped = np.log(
             np.append(self.posterior_variance[1], self.posterior_variance[1:])
         ) if len(self.posterior_variance) > 1 else np.array([])
-
+        """
+         Eq. from DDPM, Ho et al., Eq. 7
+        """
         self.posterior_mean_coef1 = (
             betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         )
@@ -204,9 +230,9 @@ class GaussianDiffusion:
         :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
         :return: A tuple (mean, variance, log_variance), all of x_start's shape.
         """
-        mean = _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-        variance = _extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
-        log_variance = _extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
+        mean = extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+        variance = extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
+        log_variance = extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
         return mean, variance, log_variance
 
     def q_sample(self, x_start, t, noise=None):
@@ -222,22 +248,10 @@ class GaussianDiffusion:
             noise = torch.randn_like(x_start)
         assert noise.shape == x_start.shape
         return (
-            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
     
-    """
-    #     x_start, x_t, t
-    #     │
-    #     ├─ posterior_mean_coef1[t] × x_start
-    #     ├─ posterior_mean_coef2[t] × x_t
-    #     │
-    #     └─ 两者相加 → posterior_mean
-    #     │             │
-    #     ├─ 查表后验方差、log方差
-    #     │
-    # [均值, 方差, log方差] → 返回
-    """
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """
         Compute the mean and variance of the diffusion posterior:
@@ -245,11 +259,11 @@ class GaussianDiffusion:
         """
         assert x_start.shape == x_t.shape
         posterior_mean = (
-            _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
+            extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
         )
-        posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = _extract_into_tensor(
+        posterior_variance = extract_into_tensor(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract_into_tensor(
             self.posterior_log_variance_clipped, t, x_t.shape
         )
         assert (
@@ -260,71 +274,83 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
-    """
-    #      x_t, t
-    #         │
-    # ┌────────▼──────────────┐
-    # │     模型前向推理       │
-    # │   model(x_t, t, ...)  │
-    # └────────┬──────────────┘
-    #         ↓
-    # if 方差learned类型?
-    #     ├─▶ 拆分mean, var，映射范围，取对数
-    #     └─▶ 查方差表
-    #         ↓
-    #     ┌───────────────┐
-    #     │   pred_xstart │ ←——（直接输出 或 由eps反解）
-    #     └──────┬────────┘
-    #         ↓
-    # q_posterior_mean_variance(pred_xstart, x_t, t)  
-    #         │
-    #         ↓
-    # 输出{mean, variance, log_variance, pred_xstart, extra}
-    """
-    def p_mean_variance(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
+    def p_mean_variance(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        model_kwargs=None,
+    ):
         """
-        Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
-        the initial x, x_0.
-        :param model: the model, which takes a signal and a batch of timesteps
-                      as input.
-        :param x: the [N x C x ...] tensor at time t.
-        :param t: a 1-D Tensor of timesteps.
-        :param clip_denoised: if True, clip the denoised signal into [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample. Applies before
-            clip_denoised.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :return: a dict with the following keys:
-                 - 'mean': the model mean output.
-                 - 'variance': the model variance output.
-                 - 'log_variance': the log of 'variance'.
-                 - 'pred_xstart': the prediction for x_0.
+        For a given noisy image x at timestep t, apply the diffusion model to predict:
+        - The mean and variance of the distribution for x_{t-1} (the next denoised step),
+        - An estimate of the original clean image x_0.
+        
+        Parameters:
+            model:          Neural network for denoising (takes x, t [, ...]).
+            x:              Current noisy image tensor at timestep t, shape [B, C, ...].
+            t:              1D tensor of current timesteps for each element in the batch, length B.
+            clip_denoised:  Whether to clamp predicted x_start to [-1, 1] (pixel range).
+            denoised_fn:    Optional function to further process the denoised image.
+            model_kwargs:   Optional dictionary for extra model arguments (e.g. conditioning).
+        
+        Returns:
+            dict with keys:
+            - 'mean':         Model-predicted mean for p(x_{t-1} | x_t).
+            - 'variance':     Model-predicted variance.
+            - 'log_variance': Log of the model variance.
+            - 'pred_xstart':  Model's prediction for x_0 (denoised clean image).
+            - 'extra':        Any auxiliary output from the model (optional).
         """
         if model_kwargs is None:
             model_kwargs = {}
-
-        B, C = x.shape[:2]
+            
+        B, C = x.shape[:2]  # Batch size (B), number of channels (C)
         assert t.shape == (B,)
+
+        # Feed input x at timestep t into the model
         model_output = model(x, t, **model_kwargs)
         if isinstance(model_output, tuple):
+            # Some models may output (prediction, extra)
             model_output, extra = model_output
         else:
             extra = None
 
+        # Handle different model variance types
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
+            # 如果模型预测了方差（而不是使用固定方差），则 model_output 包含两部分：均值 和 编码后的方差
+            # 断言检查 model_output 的形状是否符合预期
+            # B: batch size, C: 通道数, x.shape[2:]: 空间维度，如图像为 (H, W)
             assert model_output.shape == (B, C * 2, *x.shape[2:])
+
+            # 将 model_output 按通道维（dim=1）拆分成两个部分
+            # 前一半为均值预测，后一半为方差相关值（通常是未归一化的 log-variance 编码）
             model_output, model_var_values = torch.split(model_output, C, dim=1)
-            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
-            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
-            # The model_var_values is [-1, 1] for [min_var, max_var].
+
+            # 提取当前时间步 t 下，每个样本对应的最小 log-variance（来自 posterior 分布），
+            # 并扩展到与 x 相同的形状（例如 [B, C, H, W]）
+            min_log = extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+
+            # 提取当前时间步 t 下，每个样本对应的最大 log-variance，
+            # 这里使用扩散过程中的 beta 值做参考（beta 越大，方差越大）
+            max_log = extract_into_tensor(np.log(self.betas), t, x.shape)
+
+            # 将模型预测的方差值 model_var_values 从 [-1, 1] 归一化到 [0, 1] 区间
+            # 这是为了将其作为在 min_log 和 max_log 之间插值的比例 frac
             frac = (model_var_values + 1) / 2
+
+            # 使用 frac 对最小和最大 log-variance 之间进行线性插值
+            # frac 越大，model_log_variance 趋近于 max_log（预测方差越大）
+            # frac 越小，model_log_variance 趋近于 min_log（预测方差越小）
             model_log_variance = frac * max_log + (1 - frac) * min_log
+
+            # 将 log-variance 转换为真实的 variance 值，供采样使用
             model_variance = torch.exp(model_log_variance)
         else:
+            # Fixed variance types (use precomputed/known values)
             model_variance, model_log_variance = {
-                # for fixedlarge, we set the initial (log-)variance like so
-                # to get a better decoder log likelihood.
                 ModelVarType.FIXED_LARGE: (
                     np.append(self.posterior_variance[1], self.betas[1:]),
                     np.log(np.append(self.posterior_variance[1], self.betas[1:])),
@@ -334,9 +360,10 @@ class GaussianDiffusion:
                     self.posterior_log_variance_clipped,
                 ),
             }[self.model_var_type]
-            model_variance = _extract_into_tensor(model_variance, t, x.shape)
-            model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
-
+            model_variance = extract_into_tensor(model_variance, t, x.shape)
+            model_log_variance = extract_into_tensor(model_log_variance, t, x.shape)
+        
+        # Post-process x_start (predicted clean image) as needed
         def process_xstart(x):
             if denoised_fn is not None:
                 x = denoised_fn(x)
@@ -344,15 +371,25 @@ class GaussianDiffusion:
                 return x.clamp(-1, 1)
             return x
 
+        # Get x_start prediction
         if self.model_mean_type == ModelMeanType.START_X:
+            # If model predicts x_0 directly
             pred_xstart = process_xstart(model_output)
         else:
+            # If model predicts noise or velocity, recover x_0 via inverse formula
             pred_xstart = process_xstart(
                 self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
             )
-        model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
+        
+        # Compute the mean of p(x_{t-1}|x_t, x_0) ("posterior mean")
+        model_mean, _, _ = self.q_posterior_mean_variance(
+            x_start=pred_xstart, x_t=x, t=t
+        )
 
+        # All outputs should have the same shape as the input x
         assert model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
+
+        # Return all relevant values for the sampling step
         return {
             "mean": model_mean,
             "variance": model_variance,
@@ -364,14 +401,14 @@ class GaussianDiffusion:
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
         return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
+            extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
         )
 
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
         return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - pred_xstart
-        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+            extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - pred_xstart
+        ) / extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
 
     def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """
@@ -393,7 +430,7 @@ class GaussianDiffusion:
         Unlike condition_mean(), this instead uses the conditioning strategy
         from Song et al (2020).
         """
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar = extract_into_tensor(self.alphas_cumprod, t, x.shape)
 
         eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
         eps = eps - (1 - alpha_bar).sqrt() * cond_fn(x, t, **model_kwargs)
@@ -414,20 +451,28 @@ class GaussianDiffusion:
         model_kwargs=None,
     ):
         """
-        Sample x_{t-1} from the model at the given timestep.
-        :param model: the model to sample from.
-        :param x: the current tensor at x_{t-1}.
-        :param t: the value of t, starting at 0 for the first diffusion step.
-        :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample.
-        :param cond_fn: if not None, this is a gradient function that acts
-                        similarly to the model.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :return: a dict containing the following keys:
-                 - 'sample': a random sample from the model.
-                 - 'pred_xstart': a prediction of x_0.
+        P_theta x_(t-1) | x_t)
+        Perform a single reverse diffusion step: sample x_{t-1} from x_t. 
+        Parameters:
+            model:          The neural network (diffusion model) used for prediction.
+            x:              Current state/image at time t.
+            t:              Current timestep, with 0 being the final step.
+            clip_denoised:  Whether to clip x_start prediction to [-1, 1] (for images).
+            denoised_fn:    Optional function for processing x_start before sampling.
+            cond_fn:        Optional function for classifier-guided or other conditional sampling.
+            model_kwargs:   Optional extra arguments for the model (e.g., conditioning).
+        
+        Returns:
+            dict, with:
+                - 'sample': the new sample (x_{t-1}) after this step,
+                - 'pred_xstart': the predicted clean sample (x_0).
+        """
+
+        # Predict the posterior mean, variance, and model’s clean sample.
+        """
+        model_mean = sqrt_recip_alphas_t * (
+                x - betas_t * model(x, t) / sqrt_one_minus_alphas_cumprod_t
+            )
         """
         out = self.p_mean_variance(
             model,
@@ -437,13 +482,24 @@ class GaussianDiffusion:
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
+
+        # Generate Gaussian noise (of same shape as x) for stochastic sampling.
         noise = torch.randn_like(x)
+
+        # Only add noise unless this is the last step (t == 0)
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        )  # no noise when t == 0
+        )  # Shape: (batch, 1, 1, 1, ...) for broadcasting
+
+        # If using a conditional function (e.g., classifier-free guidance), adjust the mean.
         if cond_fn is not None:
             out["mean"] = self.condition_mean(cond_fn, out, x, t, model_kwargs=model_kwargs)
+
+        # Sample from Gaussian: mean + std * noise, where std = exp(0.5 * log_variance)
+        # No noise is added when t == 0 (final step).
         sample = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
+
+        # Return both the sample (for the next step) and the model's x_0 prediction.
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
     def p_sample_loop(
@@ -459,24 +515,26 @@ class GaussianDiffusion:
         progress=False,
     ):
         """
-        Generate samples from the model.
-        :param model: the model module.
-        :param shape: the shape of the samples, (N, C, H, W).
-        :param noise: if specified, the noise from the encoder to sample.
-                      Should be of the same shape as `shape`.
-        :param clip_denoised: if True, clip x_start predictions to [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample.
-        :param cond_fn: if not None, this is a gradient function that acts
-                        similarly to the model.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param device: if specified, the device to create the samples on.
-                       If not specified, use a model parameter's device.
-        :param progress: if True, show a tqdm progress bar.
-        :return: a non-differentiable batch of samples.
+        Generate the final sample(s) from the diffusion process by running the progressive sampling loop (step-by-step),
+        but return only the last (fully denoised) result.
+        
+        Parameters:
+            model:          the diffusion model module to use for sampling.
+            shape:          desired output sample shape, e.g. (N, C, H, W).
+            noise:          optional starting noise tensor (of the same shape), otherwise sampled randomly.
+            clip_denoised:  whether to clip x_start predictions to [-1, 1].
+            denoised_fn:    optional function to post-process denoised outputs before usage.
+            cond_fn:        optional conditioning function, e.g. for classifier guidance.
+            model_kwargs:   optional keyword arguments for conditional context/info.
+            device:         torch device for allocating tensors, default is model's device.
+            progress:       display a tqdm progress bar if True.
+        
+        Returns:
+            The final ("fully denoised") output sample from the diffusion process.
         """
         final = None
+        # Iterate through the progressive sampling generator.
+        # Each step yields the sample's state at that diffusion step.
         for sample in self.p_sample_loop_progressive(
             model,
             shape,
@@ -488,7 +546,10 @@ class GaussianDiffusion:
             device=device,
             progress=progress,
         ):
+            # Overwrite final at each step, so at end it's the last one.
             final = sample
+
+        # Return only the ["sample"] key (the image tensor) from the final step.
         return final["sample"]
 
     def p_sample_loop_progressive(
@@ -504,30 +565,53 @@ class GaussianDiffusion:
         progress=False,
     ):
         """
-        Generate samples from the model and yield intermediate samples from
-        each timestep of diffusion.
-        Arguments are the same as p_sample_loop().
-        Returns a generator over dicts, where each dict is the return value of
-        p_sample().
+        Generate samples from the model and yield intermediate samples
+        at each timestep of the diffusion process, allowing step-wise observation.
+        
+        Parameters:
+            model:          The diffusion model to use for generation.
+            shape:          Shape of the generated data (e.g., (batch, channels, height, width)).
+            noise:          Optional initial noise tensor. If None, sample from standard normal.
+            clip_denoised:  Whether to clip the denoised samples (e.g., to [0, 1]).
+            denoised_fn:    Optional function to modify denoised outputs.
+            cond_fn:        Optional conditioning function for guided sampling.
+            model_kwargs:   Additional arguments passed to the model.
+            device:         Computation device (e.g., 'cuda' or 'cpu').
+            progress:       Whether to display a progress bar.
+        
+        Returns:
+            Generator yielding dictionaries, each corresponding to the output of p_sample() at a timestep.
         """
+        # Automatically set device if not provided
         if device is None:
             device = next(model.parameters()).device
+
+        # Ensure shape is a tuple or list
         assert isinstance(shape, (tuple, list))
+
+        # Prepare the initial image tensor (noise or provided input)
         if noise is not None:
             img = noise
         else:
-            img = torch.randn(*shape, device=device)
+            img = torch.randn(*shape, device=device)  # Standard normal noise
+
+        # Create a list of timestep indices in reverse order
+        # 0, 1, 2, 3, 4 -> [0, 1, 2, 3, 4] -> [4, 3, 2, 1, 0]
         indices = list(range(self.num_timesteps))[::-1]
 
+        # Wrap indices with a progress bar if requested
         if progress:
-            # Lazy import so that we don't depend on tqdm.
+            # Lazy import to avoid unnecessary tqdm dependency if not used
             from tqdm.auto import tqdm
-
             indices = tqdm(indices)
 
+        # Iteratively perform sampling from each timestep, yielding intermediate results
         for i in indices:
+            # Create a tensor of current timestep for the batch, i=5, shape = (8, 3, 64, 64) (e.g., batch size 8), then [i] * shape[0] ⇒ [5, 5, 5, 5, 5, 5, 5, 5] (length 8)
             t = torch.tensor([i] * shape[0], device=device)
-            with torch.no_grad():
+
+            with torch.no_grad():  # Disable gradients for faster inference
+                # Call the sampling function for the current step
                 out = self.p_sample(
                     model,
                     img,
@@ -537,8 +621,8 @@ class GaussianDiffusion:
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
                 )
-                yield out
-                img = out["sample"]
+                yield out               # Yield intermediate result at this timestep
+                img = out["sample"]     # Update the image for the next timestep
 
     def ddim_sample(
         self,
@@ -570,8 +654,8 @@ class GaussianDiffusion:
         # in case we used x_start or x_prev prediction.
         eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
 
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
-        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+        alpha_bar = extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
         sigma = (
             eta
             * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
@@ -617,10 +701,10 @@ class GaussianDiffusion:
         # Usually our model outputs epsilon, but we re-derive it
         # in case we used x_start or x_prev prediction.
         eps = (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x.shape) * x
+            extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x.shape) * x
             - out["pred_xstart"]
-        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x.shape)
-        alpha_bar_next = _extract_into_tensor(self.alphas_cumprod_next, t, x.shape)
+        ) / extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x.shape)
+        alpha_bar_next = extract_into_tensor(self.alphas_cumprod_next, t, x.shape)
 
         # Equation 12. reversed
         mean_pred = out["pred_xstart"] * torch.sqrt(alpha_bar_next) + torch.sqrt(1 - alpha_bar_next) * eps
@@ -709,26 +793,6 @@ class GaussianDiffusion:
                 yield out
                 img = out["sample"]
 
-    """
-    #     x_start, x_t, t
-    #     │
-    # q_posterior_mean_variance
-    #     ↓
-    # true_mean, true_log_var
-    #     │
-    # [模型输出]
-    #     │
-    # p_mean_variance ───► out['mean'], out['log_variance'], out['pred_xstart']
-    #     │
-    #     ├─ KL散度: normal_kl(true_mean, true_log_var, model_mean, model_log_var)
-    #     │
-    #     └─ decoder_nll: -discretized_gaussian_log_likelihood(...)
-    #     │
-    # 按 t==0/else 切换  │
-    #     └────► output = where(t==0, decoder_nll, kl)
-    #                         │
-    #             返回 {"output": output, "pred_xstart": ...}
-    """
     def _vb_terms_bpd(
             self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
     ):
@@ -762,58 +826,6 @@ class GaussianDiffusion:
         output = torch.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
     
-    """
-    #         x_start（真实图片）
-    #         │
-    #     [1] 若无外部噪声
-    #         ├─────────────┐
-    #         ↓（采样高斯噪声）       │
-    #     noise ←─────┘
-    #         │
-    #     [2] 用 q_sample 构造扩散后的 x_t
-    #         │
-    #     x_t = q_sample(x_start, t, noise)
-    #         │
-    #     [3] 损失类型分支:
-    #     ┌───────────────────────────────┐
-    #     │                               │
-    # ┌────▼─────┐                   ┌─────▼──────┐
-    # │ loss_type│==KL/RESCALED_KL   │ loss_type==MSE/RESCALED_MSE
-    # └────┬─────┘                   └───┬────────┘
-    #     │                             │
-    # [4A] 算变分下界/                   │
-    #     │    KL损失_VB                │
-    #     │ terms["loss"] =             │
-    #     │    _vb_terms_bpd(...)       │
-    #     │                             │
-    #     └────────────┬────────────────┘
-    #                 │
-    #             [4B] MSE相关分支
-    #                 │
-    #             model_output = model(x_t, t, **model_kwargs)
-    #                 │
-    #     ┌──────────────┴───────────────────────────────┐
-    #     │ 检查是否模型“联合学习方差” (model_var_type)    │
-    #     │  ┌——————————┐                                │
-    #     │  │是         │ 否                             │
-    #     │  ↓           ↓                               │
-    #     │分 output为(mean, var) │ 直接 output为预测目标  │
-    #     │算vb   terms["vb"]=...│                        │
-    #     └──────────────┬───────────────────────────────┘
-    #                 │
-    #         [5] 计算MSE目标(target)
-    #             target ←  按 mean_type选
-    #             （可能是：x_start 或 noise 或 x_t-1）
-    #                 │
-    #         terms["mse"] = mean_flat((target - model_output)²)
-    #                 │
-    #         若含有 terms["vb"]:
-    #             terms["loss"] = terms["mse"] + terms["vb"]
-    #         否则:
-    #             terms["loss"] = terms["mse"]
-    #                 │
-    #             return terms（包含 'loss', 'mse'...）
-    """
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
@@ -950,18 +962,3 @@ class GaussianDiffusion:
             "xstart_mse": xstart_mse,
             "mse": mse,
         }
-
-
-def _extract_into_tensor(arr, timesteps, broadcast_shape):
-    """
-    Extract values from a 1-D numpy array for a batch of indices.
-    :param arr: the 1-D numpy array.
-    :param timesteps: a tensor of indices into the array to extract.
-    :param broadcast_shape: a larger shape of K dimensions with the batch
-                            dimension equal to the length of timesteps.
-    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
-    """
-    res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
-    while len(res.shape) < len(broadcast_shape):
-        res = res[..., None]
-    return res + torch.zeros(broadcast_shape, device=timesteps.device)

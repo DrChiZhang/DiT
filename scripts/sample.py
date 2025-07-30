@@ -12,11 +12,19 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from torchvision.utils import save_image
 
+import sys
+import os
+import argparse
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+models_dir = os.path.abspath(os.path.join(current_dir, '..', 'models'))
+if models_dir not in sys.path:
+    sys.path.insert(0, models_dir)
+
+from dit import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from download import find_model
-from models import DiT_models
-import argparse
 
 
 def main(args):
@@ -66,7 +74,7 @@ def main(args):
     samples = vae.decode(samples / 0.18215).sample
 
     # Save and display images:
-    save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
+    save_image(samples, "./results/sample.png", nrow=4, normalize=True, value_range=(-1, 1))
 
 
 if __name__ == "__main__":

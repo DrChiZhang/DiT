@@ -6,6 +6,7 @@ logs
 assets 
 results 
 docs
+pretrained_models
 
 # Byte-compiled files
 __pycache__/

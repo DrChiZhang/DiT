@@ -369,97 +369,139 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
     
-    #################################################################################
-    # 输入图片
-    # |
-    # [PatchEmbed]               输入t（timestep）---[TimestepEmbedder]
-    # |                          输入y（label）------[LabelEmbedder]
-    # | (patch化并编码)               |                      |
-    # |                            [t + y] (条件向量, c) <----
-    # +---------------------+         |
-    # |                     |         |
-    # v                     v         v
-    # [位置编码]           [Transformer Block1]
-    #     |                      |
-    #     |                 [adaLN调制]
-    #     ...........（循环多层Block）....... (N)
-    #     |                      |
-    #     v                      v
-    # [Transformer BlockN]       |
-    #     |                      |
-    # [FinalLayer]   <-----------+
-    #     |
-    # [unpatchify]  
-    #     |
-    # 输出图片
-    #################################################################################
     def forward(self, x, t, y):
         """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        DiT 模型的前向传播函数。
+
+        参数：
+            x : Tensor，形状 (N, C, H, W)
+                输入图像或图像的潜在表示（通常是扩散过程中某一步的 x_t）
+            t : Tensor，形状 (N,)
+                当前的扩散 timestep（整数）。用于添加时间条件。
+            y : Tensor，形状 (N,)
+                条件标签（例如分类标签），用于有条件生成。
+
+        返回：
+            Tensor，形状 (N, out_channels, H, W)
+            对 x_t 的预测结果（可能是噪声 ε 或 x_0 等），
+            用于与真实值做损失比较或在采样过程中作为中间状态。
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        # -------- 1. 对输入图像进行 patch 分割和线性投影 --------
+        # self.x_embedder 是一个 PatchEmbedding 模块（例如 Conv2d 或 linear projection + reshape）
+        # 它会将图像 x 分割成若干个 patch，然后将每个 patch 映射到 D 维 embedding 空间
+        #
+        # pos_embed 是 learnable 的位置编码，表示每个 patch 的空间位置
+        # 它会与每个 patch embedding 相加，使模型获得空间结构感知能力
+        #
+        # 输出 x 的 shape 是 (N, T, D)，其中：
+        #   - N 是 batch size
+        #   - T 是 patch 个数（通常为 H×W / patch_size²）
+        #   - D 是 token 的维度（Transformer 的 embedding size）
+        x = self.x_embedder(x) + self.pos_embed
+        # -------- 2. 时间步嵌入 --------
+        # self.t_embedder 将 timestep t（整数）映射为 D 维向量
+        # 通常是一个 TimeEmbedding 模块（如 sinusoidal 或 learnable embedding + MLP）
+        #
+        # 输出 t 的 shape 是 (N, D)，表示每个样本对应的时间信息（扩散程度）
+        t = self.t_embedder(t)
+        # -------- 3. 类别嵌入（条件标签） --------
+        # self.y_embedder 将类别标签 y 映射为 D 维向量
+        # 在训练过程中，y_embedder 可能会随机将一部分 y 设置为 None（实现 CFG 的无条件部分）
+        #
+        # 输出 y 的 shape 也是 (N, D)，与 t 相同
+        y = self.y_embedder(y, self.training)
+        # -------- 4. 合并时间嵌入和类别嵌入作为上下文条件 --------
+        # 将时间 t 和类别 y 相加，得到一个统一的条件向量 c
+        # 这个条件会传递给 transformer 的每一层 block，用于调节每层的输出
+        c = t + y
+
+        # -------- 5. Transformer Block 前向传播 --------
+        # 遍历多层 transformer block，每一层都对 token 序列进行自注意力和前馈网络处理
+        # 每个 block 同时接受：
+        #   - x: 当前 token 序列（图像 patch 的嵌入）
+        #   - c: 条件向量，用于调节注意力或添加到 embedding 中（如 FiLM、cross-attn 等）
+        #
+        # 输出 x 的形状仍保持不变：(N, T, D)
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
-        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
+            x = block(x, c)
+
+        # -------- 6. Transformer 最后一层输出映射 --------
+        # 将 transformer 最后的输出 token 序列，转换为 patch 的像素值
+        # 也就是从 token embedding 空间 (D) 映射回 patch 空间
+        #
+        # 通常每个 token 输出 patch_size² × out_channels 维的向量，
+        # 用于恢复一个 patch 的像素块
+        # (N, T, patch_size ** 2 * out_channels)
+        x = self.final_layer(x, c)                
+
+        # -------- 7. 将 patch token 重构为图像 --------
+        # 使用 self.unpatchify 将 token 序列拼接还原为图像：
+        #   - 按顺序将 patch 排布回 H×W 的图像结构
+        #   - 通道数设为 out_channels（如 RGB 的 3 或 latent 的 4）
+        #
+        # 通常会 reshape + permute + reshape 来实现
+        x = self.unpatchify(x)                 
+
+        # (N, C, H, W) or (N, C*2, H, W) if learn_sigma is true. 
         return x
     
-    #################################################################################
-    # Input: x, t, y, cfg_scale
-    #     │
-    # Split x in half (for CFG, N->N/2)
-    #     │
-    #     ├─────────────┐
-    #     │             │
-    # [Half batch]  [Half batch]      # 两份完全一样
-    #     │             │
-    #     └────Cat──────┘
-    #         │
-    # [combined]  (N, ...)
-    #         │
-    # Forward (model_out = self.forward(combined, t, y))
-    #         │
-    # ┌─────────────┬───────────────┐
-    # │ 前3通道 (eps) │ 其余通道 (rest) │
-    # └──────┬───────┘
-    #         │
-    #     Split along batch (N/2, ...)
-    # ┌──────────┬─────────┐
-    # │ uncond   │  cond   │   # 一半是uncond, 一半是cond
-    # └────┬─────┘
-    #         │
-    #     CFG Formula:  half_eps = uncond + cfg_scale * (cond - uncond)
-    #         │
-    #     Cat (repeat for both halves)
-    #         │
-    # [eps, rest] (Complete output, shape as in forward)
-    #         │
-    #     Return
-    #################################################################################
+
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
-        Forward with classifier-free guidance (CFG): runs both conditional and unconditional forward passes
-        and returns the interpolated result. Used during diffusion sampling.
+        利用 Classifier-Free Guidance（CFG）机制执行前向传播。
+        该机制在采样过程中运行有条件与无条件两个前向预测，并通过 cfg_scale 控制其插值强度，
+        以提升生成图像对条件（如文本、类别等）的响应能力。
+
+        参数：
+            x : Tensor
+                当前的扩散图像 x_t，形状通常为 [B, C, H, W]
+            t : Tensor
+                当前扩散的时间步 step（例如 DDPM 中的 t），通常为形如 [B] 的整数张量
+            y : 条件信息（如类别标签、文本 embedding）
+            cfg_scale : float
+                指导强度（scale）。通常为 1.0（不引导）或 >1.0（增强对条件的遵循）
+
+        返回：
+            Tensor，预测输出，结构与模型原始输出一致（通常为预测噪声和可能的方差信息）
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        # Split batch in half: first half go through conditional and unconditional branches
-        half = x[: len(x) // 2]
+        
+        # Step 1: 将输入 x 分为一半，用于创建一组无条件和有条件的输入
+        # x[:len(x)//2] 相当于 batch 的前半部分，假设 batch size 为 8，则取前 4 个样本
+        half = x[: len(x) // 2]  # 形状：[B/2, C, H, W]
+
+        # Step 2: 将这 4 个样本复制一遍，拼接成 [8, C, H, W]，用于分别进行无条件与有条件预测
+        # 第一个 4 个用于无条件预测（如 y=None），后 4 个用于有条件预测（如 y=文本、标签）
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
+
+        # Step 3: 运行模型前向传播，传入 combined, t, y
+        # 由于 combined 有 2 份，y 也必须能与其匹配（可能在 self.forward 内处理 y=None 的情况）
+        model_out = self.forward(combined, t, y)  # 形状：[B, C_out, H, W]
+
+        # Step 4: 拆分模型输出为两个部分
+        # - 第一部分是预测的 ε（噪声分量），一般用于还原 x0 或做去噪
+        # - 第二部分可能是预测的 log-variance 或其他辅助分量（如 DDIM/GuidedDiffusion 结构）
+
+        # 可选：使用下面一行替换当前这行，可以对所有通道进行 CFG（标准做法）
         # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+
+        # 这里按 OpenAI GLIDE 的实现，只对前三个通道做 CFG（例如 RGB）
         eps, rest = model_out[:, :3], model_out[:, 3:]
+
+        # Step 5: 拆分 eps 为两个部分：有条件的预测和无条件的预测
+        # - 前半部分是无条件预测结果（通常是 y=None）
+        # - 后半部分是有条件预测结果（使用 y）
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+
+        # Step 6: 使用 Classifier-Free Guidance 公式插值
+        #   ε_guided = ε_uncond + scale * (ε_cond - ε_uncond)
+        #   - 当 scale = 1：结果等于无条件预测，不引导
+        #   - 当 scale > 1：结果更偏向于条件预测，可提升生成样本质量
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+
+        # Step 7: 将插值结果拼接回完整 batch（复制一份是因为 batch 对应了两种情况）
         eps = torch.cat([half_eps, half_eps], dim=0)
+
+        # Step 8: 将经过引导的 eps 与剩余部分（如 log-variance）重新拼接，作为模型最终输出
         return torch.cat([eps, rest], dim=1)
 
 

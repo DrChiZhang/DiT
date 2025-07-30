@@ -24,7 +24,7 @@ conda_env="/home/chizhang/myprefix/anaconda3/envs/dit"
 source /home/chizhang/myprefix/anaconda3/etc/profile.d/conda.sh
 conda activate $conda_env
 export CUDA_HOME=$conda_env
-export CUDA_VISIBLE_DEVICES=0,3
+export CUDA_VISIBLE_DEVICES=2,3
 
 echo "============================================================================================"
 echo "Starting training taks"
