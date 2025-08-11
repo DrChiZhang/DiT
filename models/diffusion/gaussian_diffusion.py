@@ -239,17 +239,20 @@ class GaussianDiffusion:
         """
         Diffuse the data for a given number of diffusion steps.
         In other words, sample from q(x_t | x_0).
-        :param x_start: the initial data batch.
-        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-        :param noise: if specified, the split-out normal noise.
-        :return: A noisy version of x_start.
+        :param x_start:     the initial data batch.
+        :param t:           the number of diffusion steps (minus 1). Here, 0 means one step.
+        :param noise:       if specified, the split-out normal noise.
+        :return:            A noisy version of x_start.
         """
         if noise is None:
             noise = torch.randn_like(x_start)
         assert noise.shape == x_start.shape
+
+        """
+        sqrt(alpha_cumprod) * x_0 + sqrt(1 - alpha_cumprod) * noise
+        """
         return (
-            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
     
     def q_posterior_mean_variance(self, x_start, x_t, t):
@@ -819,7 +822,10 @@ class GaussianDiffusion:
             x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
         )
         assert decoder_nll.shape == x_start.shape
-        decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+        decoder_nll = mean_flat(decoder_nll) / np.log(2.0) 
+        """
+        在扩散模型（如 DDPM) 我们计算的“变分下界 ELBO” 实际是对 "-log(p_x)' 通过把 ELBO (以 nats 为单位）除以 "log 2" 就得到了 bit-per-dimension.
+        """
 
         # At the first timestep return the decoder NLL,
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
@@ -866,15 +872,24 @@ class GaussianDiffusion:
                 # Learn the variance using the variational bound, but don't let it affect our mean prediction.
                 frozen_out = torch.cat([model_output.detach(), model_var_values], dim=1)
                 terms["vb"] = self._vb_terms_bpd(
-                                                model=lambda *args, r=frozen_out: r, # Python匿名函数（lambda）+ 默认参数的典型组合用法，经常用来"临时伪装"一个模型接口，让其无论传入什么参数，都只返回你想要的那个张量frozen_out
+                                                #  lambda 表达式，其作用是定义一个临时模型函数，无论传入什么参数，始终返回 frozen_out
+                                                model = lambda *args, r=frozen_out: r, 
                                                 x_start=x_start,
                                                 x_t=x_t,
                                                 t=t,
                                                 clip_denoised=False,
-                            )["output"]
+                )["output"]
                 if self.loss_type == LossType.RESCALED_MSE:
-                    terms["vb"] *= self.num_timesteps / 1000.0  # Divide by 1000 for equivalence with initial implementation. Without a factor of 1/1000, the VB term hurts the MSE term.
-
+                    # Divide by 1000 for equivalence with initial implementation. Without a factor of 1/1000, the VB term hurts the MSE term.
+                    terms["vb"] *= self.num_timesteps / 1000.0 
+            """
+            if self.model_mean_type == ModelMeanType.PREVIOUS_X:
+                target = q(x_{t-1} | x_t, x_0) 的均值
+            elif self.model_mean_type == ModelMeanType.START_X:
+                target = x_0
+            elif self.model_mean_type == ModelMeanType.EPSILON:
+                target = ε
+            """
             target = {
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance( x_start=x_start, x_t=x_t, t=t )[0],
                 ModelMeanType.START_X: x_start,
@@ -883,6 +898,7 @@ class GaussianDiffusion:
 
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)
+            
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:

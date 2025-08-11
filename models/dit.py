@@ -11,6 +11,8 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
@@ -19,6 +21,66 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+# class PatchEmbed(nn.Module):
+#     def __init__(self, img_size=64, patch_size=2, in_chans=3, embed_dim=768):
+#         super().__init__()
+#         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+#     def forward(self, x):
+#         x = self.proj(x)  # [B, C, H, W]
+#         x = x.flatten(2).transpose(1, 2)  # [B, N, C]
+#         return x
+
+# class Mlp(nn.Module):
+#     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.SiLU, drop=0.):
+#         super().__init__()
+#         out_features = out_features or in_features
+#         hidden_features = hidden_features or in_features
+#         self.fc1 = nn.Linear(in_features, hidden_features)
+#         self.act = act_layer()
+#         self.fc2 = nn.Linear(hidden_features, out_features)
+#         self.drop = nn.Dropout(drop)
+
+#     def forward(self, x):
+#         x = self.fc1(x)
+#         x = self.act(x)
+#         x = self.drop(x)
+#         x = self.fc2(x)
+#         x = self.drop(x)
+#         return x
+        
+class FlashAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "hidden dim must be divisible by num_heads"
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        # QKV projection
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, N, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Flash Attention / Scaled Dot Product Attention
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            is_causal=False
+        )
+
+        # Merge heads
+        out = attn_output.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -136,34 +198,6 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
-
-#################################################################################
-#                                 Core DiT Model                                #
-# x_in
-#  │
-#  ├─[LayerNorm1]─────┬───────────┐
-#  │                  │           │
-#  │   [modulate]     │           │
-#  │        │         │           │
-#  │   [Attention]    │           │
-#  │        │         │           │
-#  │   (×gate_msa)----┘           │
-#  │      │                       │
-#  └───> [Residual Add] <──────────┘        （1）
-#          │
-#    ├────[LayerNorm2]─────┬───────────┐
-#    │                     │           │
-#    │     [modulate]      │           │
-#    │         │           │           │
-#    │      [MLP]          │           │
-#    │         │           │           │
-#    │   (×gate_mlp)-------┘           │
-#    │        │                        │
-#    └──> [Residual Add] <─────────────┘       （2）
-#             │
-#          output
-#################################################################################
-
 class DiTBlock(nn.Module):
     """
     A DiT (Diffusion Transformer) block with adaptive layer norm zero (adaLN-Zero) conditioning.
@@ -175,7 +209,8 @@ class DiTBlock(nn.Module):
         # LayerNorm layers; no affine as modulation will be performed conditionally
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # Multi-head self-attention
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        # self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.attn = FlashAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # MLP hidden dimension, typically 4x the hidden size
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
